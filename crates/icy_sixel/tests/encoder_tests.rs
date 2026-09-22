@@ -1,4 +1,4 @@
-use icy_sixel::{EncodeOptions, QuantizeMethod, SixelError, SixelImage};
+use icy_sixel::{EncodeOptions, QuantizeMethod, SixelEncoder, SixelError, SixelImage};
 
 #[test]
 fn long_runs_roundtrip_across_repeat_limit() {
@@ -92,4 +92,54 @@ fn fully_transparent_images_roundtrip() {
         assert_eq!(decoded.dimensions(), (width, height));
         assert!(decoded.pixels.as_chunks::<4>().0.iter().all(|pixel| pixel[3] == 0));
     }
+}
+
+#[test]
+fn a_reused_encoder_matches_a_fresh_encode() {
+    // Vary the size, the color count and the transparency, so every reused
+    // buffer has to grow, shrink and be cleared between two frames.
+    let frames = [
+        (4, 3, 255u8, QuantizeMethod::Wu, 0.0),
+        (40, 31, 255, QuantizeMethod::Wu, 0.875),
+        (7, 9, 100, QuantizeMethod::kmeans(), 0.875),
+        (40, 31, 100, QuantizeMethod::Wu, 0.0),
+        (1, 1, 255, QuantizeMethod::Wu, 0.875),
+    ];
+    let mut encoder = SixelEncoder::new();
+    let mut out = String::new();
+    for (width, height, alpha, quantize_method, diffusion) in frames {
+        let mut pixels = Vec::with_capacity(width * height * 4);
+        for i in 0..width * height {
+            pixels.extend_from_slice(&[(i * 7 % 256) as u8, (i * 13 % 256) as u8, (i * 29 % 256) as u8]);
+            pixels.push(if i % 3 == 0 { alpha } else { 255 });
+        }
+        let opts = EncodeOptions {
+            diffusion,
+            quantize_method,
+            ..Default::default()
+        };
+        encoder = encoder.with_options(opts.clone());
+        out.clear();
+        encoder.encode_into(&pixels, width, height, &mut out).unwrap();
+        assert_eq!(out, icy_sixel::sixel_encode(&pixels, width, height, &opts).unwrap());
+    }
+}
+
+#[test]
+fn encode_into_appends_and_keeps_out_on_an_error() {
+    let mut encoder = SixelEncoder::new();
+    let mut out = String::from("prefix");
+    encoder.encode_into(&[255, 0, 0, 255], 1, 1, &mut out).unwrap();
+    let one = out.clone();
+    assert!(one.starts_with("prefix\x1bP"));
+
+    assert!(matches!(
+        encoder.encode_into(&[255, 0, 0], 1, 1, &mut out),
+        Err(SixelError::BufferSizeMismatch { expected: 4, actual: 3 })
+    ));
+    assert_eq!(out, one);
+
+    // A second image appends to the first.
+    encoder.encode_into(&[0, 0, 255, 255], 1, 1, &mut out).unwrap();
+    assert_eq!(out.matches('\x1b').count(), 4);
 }

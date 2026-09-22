@@ -45,7 +45,7 @@ pub use decoder::{
 };
 #[allow(deprecated)]
 pub use encoder::{sixel_encode, sixel_encode_default};
-pub use encoder::{EncodeOptions, QuantizeMethod};
+pub use encoder::{EncodeOptions, QuantizeMethod, SixelEncoder};
 pub use sixel_image::{BackgroundMode, PixelAspectRatio, SixelImage};
 
 /// Errors that can occur during SIXEL encoding or decoding.

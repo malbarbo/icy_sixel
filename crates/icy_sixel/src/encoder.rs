@@ -27,16 +27,24 @@ struct Rgb {
 ///
 /// Uses 1/8 the memory of a `Vec<bool>`, which improves cache behavior in the
 /// per-color band-encoding loop that re-reads the opacity mask many times.
+#[derive(Clone, Debug, Default)]
 struct BitMask {
     words: Vec<u64>,
 }
 
 impl BitMask {
     /// Create a mask with `len` bits, all cleared.
+    #[cfg(test)]
     fn zeros(len: usize) -> Self {
-        Self {
-            words: vec![0; len.div_ceil(64)],
-        }
+        let mut mask = Self::default();
+        mask.reset(len);
+        mask
+    }
+
+    /// Clear every bit and give the mask `len` bits, keeping the allocation.
+    fn reset(&mut self, len: usize) {
+        self.words.clear();
+        self.words.resize(len.div_ceil(64), 0);
     }
 
     /// Set the bit at `index` to 1.
@@ -126,124 +134,286 @@ pub(crate) fn sixel_encode_impl(
     pixel_aspect_ratio: PixelAspectRatio,
     background_mode: BackgroundMode,
 ) -> Result<String> {
-    crate::validate_encode_dimensions(width, height)?;
-    if width == 0 || height == 0 {
-        return Err(SixelError::InvalidDimensions { width, height });
-    }
-    let expected = width.checked_mul(height).and_then(|v| v.checked_mul(4)).ok_or(SixelError::IntegerOverflow)?;
-    if rgba.len() != expected {
-        return Err(SixelError::BufferSizeMismatch { expected, actual: rgba.len() });
-    }
-    let image_width = u32::try_from(width).map_err(|_| SixelError::InvalidDimensions { width, height })?;
-    let image_height = u32::try_from(height).map_err(|_| SixelError::InvalidDimensions { width, height })?;
+    let mut encoder = SixelEncoder::new()
+        .with_options(opts.clone())
+        .with_aspect_ratio(pixel_aspect_ratio)
+        .with_background_mode(background_mode);
+    let mut out = String::new();
+    encoder.encode_into(rgba, width, height, &mut out)?;
+    Ok(out)
+}
 
-    // Single pass over the RGBA buffer building both the transparency mask
-    // (set bit = opaque) and the Srgb<u8> pixels used for quantization
-    // (quantette uses palette crate types).
-    let pixel_count = expected / 4;
-    let mut opacity_mask = BitMask::zeros(pixel_count);
-    let mut opaque_count = 0;
-    let mut rgb_pixels: Vec<Srgb<u8>> = Vec::with_capacity(pixel_count);
-    for (i, c) in rgba.as_chunks::<4>().0.iter().enumerate() {
-        if c[3] >= 128 {
-            opacity_mask.set(i);
-            opaque_count += 1;
+/// An encoder that reuses its buffers from one image to the next.
+///
+/// [`sixel_encode`] and [`SixelImage::encode`](crate::SixelImage::encode)
+/// allocate the scratch buffers and the output string on every call. A program
+/// that encodes a stream of frames, such as a terminal animation or a video
+/// player, keeps one `SixelEncoder` and calls [`encode_into`](Self::encode_into)
+/// with a string it owns, so consecutive frames of the same size allocate
+/// nothing in the encoder.
+///
+/// # Example
+/// ```rust
+/// use icy_sixel::SixelEncoder;
+///
+/// let mut encoder = SixelEncoder::new();
+/// let mut out = String::new();
+/// for red in [0u8, 128, 255] {
+///     let rgba = [red, 0, 0, 255];
+///     out.clear();
+///     encoder.encode_into(&rgba, 1, 1, &mut out)?;
+///     print!("{out}");
+/// }
+/// # Ok::<(), icy_sixel::SixelError>(())
+/// ```
+#[derive(Clone, Debug, Default)]
+pub struct SixelEncoder {
+    options: EncodeOptions,
+    aspect_ratio: PixelAspectRatio,
+    background_mode: BackgroundMode,
+    scratch: Scratch,
+}
+
+impl SixelEncoder {
+    /// Create an encoder with the default options.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the encoding options.
+    #[must_use]
+    pub fn with_options(mut self, options: EncodeOptions) -> Self {
+        self.options = options;
+        self
+    }
+
+    /// Set the pixel aspect ratio the DCS introducer and the raster attributes announce.
+    #[must_use]
+    pub fn with_aspect_ratio(mut self, aspect_ratio: PixelAspectRatio) -> Self {
+        self.aspect_ratio = aspect_ratio;
+        self
+    }
+
+    /// Set the background mode the DCS introducer announces.
+    #[must_use]
+    pub fn with_background_mode(mut self, background_mode: BackgroundMode) -> Self {
+        self.background_mode = background_mode;
+        self
+    }
+
+    /// Encode RGBA image data and append the SIXEL to `out`.
+    ///
+    /// `rgba` holds 4 bytes per pixel and `width` by `height` pixels. A pixel
+    /// with alpha below 128 is transparent, as in [`sixel_encode`]. An error
+    /// leaves `out` with the contents it had.
+    pub fn encode_into(&mut self, rgba: &[u8], width: usize, height: usize, out: &mut String) -> Result<()> {
+        let written = out.len();
+        let result = self.append(rgba, width, height, out);
+        if result.is_err() {
+            out.truncate(written);
         }
-        rgb_pixels.push(Srgb::new(c[0], c[1], c[2]));
+        result
     }
 
-    // Set up quantette pipeline
-    let max_colors = opts.max_colors.clamp(2, 256) as u8;
-    let palette_size = PaletteSize::try_from(max_colors).unwrap_or(PaletteSize::MAX);
+    fn append(&mut self, rgba: &[u8], width: usize, height: usize, out: &mut String) -> Result<()> {
+        crate::validate_encode_dimensions(width, height)?;
+        let expected = width.checked_mul(height).and_then(|v| v.checked_mul(4)).ok_or(SixelError::IntegerOverflow)?;
+        if rgba.len() != expected {
+            return Err(SixelError::BufferSizeMismatch { expected, actual: rgba.len() });
+        }
+        let image_width = u32::try_from(width).map_err(|_| SixelError::InvalidDimensions { width, height })?;
+        let image_height = u32::try_from(height).map_err(|_| SixelError::InvalidDimensions { width, height })?;
+        let header = Header {
+            width,
+            height,
+            aspect_ratio: self.aspect_ratio,
+            background_mode: self.background_mode,
+        };
 
-    // Create image reference for quantette
-    let image = ImageRef::new(image_width, image_height, &rgb_pixels).map_err(|e| SixelError::Quantization(e.to_string()))?;
+        // Single pass over the RGBA buffer building both the transparency mask
+        // (set bit = opaque) and the Srgb<u8> pixels used for quantization
+        // (quantette uses palette crate types).
+        let pixel_count = expected / 4;
+        let scratch = &mut self.scratch;
+        scratch.opacity_mask.reset(pixel_count);
+        scratch.rgb_pixels.clear();
+        scratch.rgb_pixels.reserve(pixel_count);
+        let mut opaque_count = 0;
+        for (i, c) in rgba.as_chunks::<4>().0.iter().enumerate() {
+            if c[3] >= 128 {
+                scratch.opacity_mask.set(i);
+                opaque_count += 1;
+            }
+            scratch.rgb_pixels.push(Srgb::new(c[0], c[1], c[2]));
+        }
 
-    // Use configured quantization method with diffusion-based dithering
-    let diffusion = opts.diffusion.clamp(0.0, 1.0);
-    let pipeline = Pipeline::new().palette_size(palette_size).quantize_method(opts.quantize_method.clone());
+        // Set up quantette pipeline
+        let max_colors = self.options.max_colors.clamp(2, 256) as u8;
+        let palette_size = PaletteSize::try_from(max_colors).unwrap_or(PaletteSize::MAX);
 
-    if opaque_count != pixel_count {
-        let (palette, indices) = quantize_transparent(&rgb_pixels, &opacity_mask, width, pipeline, diffusion)?;
-        return encode_indexed_to_sixel(&palette, &indices, &opacity_mask, width, height, pixel_aspect_ratio, background_mode);
-    }
+        // Use configured quantization method with diffusion-based dithering
+        let diffusion = self.options.diffusion.clamp(0.0, 1.0);
+        let pipeline = Pipeline::new().palette_size(palette_size).quantize_method(self.options.quantize_method.clone());
 
-    // Apply dithering based on diffusion setting
-    let indexed_image = if diffusion <= 0.0 {
-        // No dithering - sharp edges, may show banding
-        pipeline.ditherer(None).input_image(image).output_srgb8_indexed_image()
-    } else {
-        // Use Floyd-Steinberg dithering with specified diffusion strength
-        let ditherer = FloydSteinberg::with_error_diffusion(diffusion).unwrap_or_default();
-        pipeline.ditherer(ditherer).input_image(image).output_srgb8_indexed_image()
-    };
+        if opaque_count != pixel_count {
+            quantize_transparent(scratch, width, pipeline, diffusion)?;
+            let Scratch {
+                palette,
+                indices,
+                opacity_mask,
+                bands,
+                ..
+            } = scratch;
+            return encode_indexed_to_sixel(palette, indices, opacity_mask, header, bands, out);
+        }
 
-    // Extract palette and indices
-    let palette: Vec<Rgb> = indexed_image
-        .palette()
-        .iter()
-        .map(|c| Rgb {
+        // Create image reference for quantette
+        let image = ImageRef::new(image_width, image_height, &scratch.rgb_pixels).map_err(|e| SixelError::Quantization(e.to_string()))?;
+
+        // Apply dithering based on diffusion setting
+        let indexed_image = if diffusion <= 0.0 {
+            // No dithering - sharp edges, may show banding
+            pipeline.ditherer(None).input_image(image).output_srgb8_indexed_image()
+        } else {
+            // Use Floyd-Steinberg dithering with specified diffusion strength
+            let ditherer = FloydSteinberg::with_error_diffusion(diffusion).unwrap_or_default();
+            pipeline.ditherer(ditherer).input_image(image).output_srgb8_indexed_image()
+        };
+
+        // Extract the palette. The indices stay in the image quantette returned,
+        // so they are read in place.
+        scratch.palette.clear();
+        scratch.palette.extend(indexed_image.palette().iter().map(|c| Rgb {
             r: c.red,
             g: c.green,
             b: c.blue,
-        })
-        .collect();
+        }));
 
-    let indices: Vec<u8> = indexed_image.indices().to_vec();
+        // Encode to SIXEL with transparency support
+        let Scratch {
+            palette, opacity_mask, bands, ..
+        } = scratch;
+        encode_indexed_to_sixel(palette, indexed_image.indices(), opacity_mask, header, bands, out)
+    }
+}
 
-    // Encode to SIXEL with transparency support
-    encode_indexed_to_sixel(&palette, &indices, &opacity_mask, width, height, pixel_aspect_ratio, background_mode)
+/// The buffers an encoder keeps from one image to the next.
+#[derive(Clone, Debug, Default)]
+struct Scratch {
+    /// The RGB of every pixel, as quantette takes them.
+    rgb_pixels: Vec<Srgb<u8>>,
+    /// One bit per pixel, set when the pixel is opaque.
+    opacity_mask: BitMask,
+    /// The quantized palette.
+    palette: Vec<Rgb>,
+    /// One palette index per pixel, filled only when the image has transparency.
+    /// An opaque image reads the indices of the quantette image in place.
+    indices: Vec<u8>,
+    /// The buffers of the band loop.
+    bands: Bands,
+    /// The buffers of the masked dithering.
+    dither: Dither,
+}
+
+/// What the DCS introducer and the raster attributes announce about the image.
+#[derive(Clone, Copy, Debug)]
+struct Header {
+    width: usize,
+    height: usize,
+    aspect_ratio: PixelAspectRatio,
+    background_mode: BackgroundMode,
+}
+
+/// The buffers of the band loop in [`encode_indexed_to_sixel`].
+#[derive(Clone, Debug, Default)]
+struct Bands {
+    /// The 6-bit sixel value of every (color, column) pair in the band.
+    sixels: Vec<u8>,
+    /// Whether the color appears in the band.
+    colors_used: Vec<bool>,
+}
+
+/// The buffers of [`map_visible_pixels`].
+#[derive(Clone, Debug, Default)]
+struct Dither {
+    /// The opaque pixels alone, which train the palette.
+    opaque_pixels: Vec<Srgb<u8>>,
+    /// Every pixel in Oklab, where the error diffusion runs.
+    colors: Vec<Oklab>,
+    /// The error carried into the row in progress and into the row below it.
+    current: Vec<[f32; 3]>,
+    next: Vec<[f32; 3]>,
 }
 
 /// Quantette has no alpha-mask support. Train its palette only on visible pixels,
 /// then map the original layout without diffusing error through transparent pixels.
-fn quantize_transparent(pixels: &[Srgb<u8>], opacity_mask: &BitMask, width: usize, pipeline: Pipeline, diffusion: f32) -> Result<(Vec<Rgb>, Vec<u8>)> {
-    let opaque_pixels: Vec<_> = pixels
-        .iter()
-        .enumerate()
-        .filter_map(|(i, &pixel)| opacity_mask.get(i).then_some(pixel))
-        .collect();
-    if opaque_pixels.is_empty() {
+/// Leaves the result in `scratch.palette` and `scratch.indices`.
+fn quantize_transparent(scratch: &mut Scratch, width: usize, pipeline: Pipeline, diffusion: f32) -> Result<()> {
+    let Scratch {
+        rgb_pixels,
+        opacity_mask,
+        palette,
+        indices,
+        dither,
+        ..
+    } = scratch;
+    palette.clear();
+    indices.clear();
+    dither.opaque_pixels.clear();
+    dither
+        .opaque_pixels
+        .extend(rgb_pixels.iter().enumerate().filter_map(|(i, &pixel)| opacity_mask.get(i).then_some(pixel)));
+    if dither.opaque_pixels.is_empty() {
         // Raster attributes preserve the dimensions; no color or index is used.
-        return Ok((Vec::new(), Vec::new()));
+        return Ok(());
     }
 
-    let palette = pipeline
-        .input_slice(&opaque_pixels)
+    let quantized = pipeline
+        .input_slice(&dither.opaque_pixels)
         .map_err(|e| SixelError::Quantization(e.to_string()))?
         .output_oklab_palette();
-    drop(opaque_pixels);
-    let color_map = NearestNeighborColorMap::new(palette);
-    let colors = srgb8_to_oklab(pixels);
-    let indices = map_visible_pixels(&colors, opacity_mask, width, &color_map, diffusion);
-    let palette = oklab_to_srgb8(color_map.palette())
-        .into_iter()
-        .map(|c| Rgb {
-            r: c.red,
-            g: c.green,
-            b: c.blue,
-        })
-        .collect();
-    Ok((palette, indices))
+    let color_map = NearestNeighborColorMap::new(quantized);
+    dither.colors.clear();
+    dither.colors.extend(srgb8_to_oklab(rgb_pixels));
+    indices.resize(dither.colors.len(), 0);
+    map_visible_pixels(dither, opacity_mask, width, &color_map, diffusion, indices);
+    palette.extend(oklab_to_srgb8(color_map.palette()).into_iter().map(|c| Rgb {
+        r: c.red,
+        g: c.green,
+        b: c.blue,
+    }));
+    Ok(())
 }
 
 /// Serpentine Floyd–Steinberg in Oklab, with transparent pixels acting as sinks
 /// for incoming error. The palette and nearest-neighbor search come from quantette.
-fn map_visible_pixels(colors: &[Oklab], opacity_mask: &BitMask, width: usize, color_map: &NearestNeighborColorMap<Oklab, f32, 3>, diffusion: f32) -> Vec<u8> {
-    let mut indices = vec![0; colors.len()];
+/// `indices` holds one zeroed entry per pixel and receives the palette index of
+/// every opaque pixel.
+fn map_visible_pixels(
+    dither: &mut Dither,
+    opacity_mask: &BitMask,
+    width: usize,
+    color_map: &NearestNeighborColorMap<Oklab, f32, 3>,
+    diffusion: f32,
+    indices: &mut [u8],
+) {
+    let colors = &dither.colors;
     if diffusion <= 0.0 {
         for (i, color) in colors.iter().enumerate() {
             if opacity_mask.get(i) {
                 indices[i] = color_map.palette_index(color);
             }
         }
-        return indices;
+        return;
     }
 
     // Match the opaque pipeline's fallback for non-finite diffusion values.
     let diffusion = FloydSteinberg::with_error_diffusion(diffusion).unwrap_or_default().error_diffusion();
-    let mut current = vec![[0.0; 3]; width + 2];
-    let mut next = vec![[0.0; 3]; width + 2];
+    let (current, next) = (&mut dither.current, &mut dither.next);
+    current.clear();
+    current.resize(width + 2, [0.0; 3]);
+    next.clear();
+    next.resize(width + 2, [0.0; 3]);
     for (y, row) in colors.chunks_exact(width).enumerate() {
         let left_to_right = y % 2 == 0;
         for step in 0..width {
@@ -267,10 +437,9 @@ fn map_visible_pixels(colors: &[Oklab], opacity_mask: &BitMask, width: usize, co
                 next[forward][channel] += error;
             }
         }
-        std::mem::swap(&mut current, &mut next);
+        std::mem::swap(current, next);
         next.fill([0.0; 3]);
     }
-    indices
 }
 
 /// Encode RGBA with default options.
@@ -282,23 +451,19 @@ pub fn sixel_encode_default(rgba: &[u8], width: usize, height: usize) -> Result<
     sixel_encode(rgba, width, height, &EncodeOptions::default())
 }
 
-fn encode_indexed_to_sixel(
-    palette: &[Rgb],
-    indices: &[u8],
-    opacity_mask: &BitMask,
-    width: usize,
-    height: usize,
-    aspect_ratio: PixelAspectRatio,
-    background_mode: BackgroundMode,
-) -> Result<String> {
-    let mut out = String::new();
-
+fn encode_indexed_to_sixel(palette: &[Rgb], indices: &[u8], opacity_mask: &BitMask, header: Header, bands: &mut Bands, out: &mut String) -> Result<()> {
+    let Header {
+        width,
+        height,
+        aspect_ratio,
+        background_mode,
+    } = header;
     // DCS introducer for SIXEL: ESC P p1 ; p2 ; p3 q
     // p1=aspect ratio, p2=background mode, p3=0 (grid size default)
     out.push_str("\x1bP");
-    write_number(&mut out, aspect_ratio.to_p1_value() as usize);
+    write_number(out, aspect_ratio.to_p1_value() as usize);
     out.push(';');
-    write_number(&mut out, background_mode.to_p2_value() as usize);
+    write_number(out, background_mode.to_p2_value() as usize);
     out.push_str(";0q");
 
     // Set raster attributes: " Pan ; Pad ; Ph ; Pv
@@ -306,13 +471,13 @@ fn encode_indexed_to_sixel(
     // Emitting this is required for terminals and multiplexers (e.g. tmux) that
     // drop or rewrite P1 but forward the raster attributes.
     out.push('"');
-    write_number(&mut out, aspect_ratio.pad() as usize);
+    write_number(out, aspect_ratio.pad() as usize);
     out.push(';');
-    write_number(&mut out, aspect_ratio.pan() as usize);
+    write_number(out, aspect_ratio.pan() as usize);
     out.push(';');
-    write_number(&mut out, width);
+    write_number(out, width);
     out.push(';');
-    write_number(&mut out, height);
+    write_number(out, height);
 
     // Define palette in RGB percent (0-100)
     for (i, c) in palette.iter().enumerate() {
@@ -321,28 +486,31 @@ fn encode_indexed_to_sixel(
         let g = (c.g as u32 * 100 + 127) / 255;
         let b = (c.b as u32 * 100 + 127) / 255;
         out.push('#');
-        write_number(&mut out, i);
+        write_number(out, i);
         out.push(';');
         out.push('2');
         out.push(';');
-        write_number(&mut out, r as usize);
+        write_number(out, r as usize);
         out.push(';');
-        write_number(&mut out, g as usize);
+        write_number(out, g as usize);
         out.push(';');
-        write_number(&mut out, b as usize);
+        write_number(out, b as usize);
     }
 
-    let bands = height.div_ceil(6);
+    let band_count = height.div_ceil(6);
     let palette_len = palette.len();
 
     // Scratch buffer holding the 6-bit sixel value for every (color, column)
     // pair in the current band. Reused across bands; only the rows of colors
     // actually used in a band are cleared, so this stays cheap.
     let scratch_len = palette_len.checked_mul(width).ok_or(SixelError::IntegerOverflow)?;
-    let mut sixels = vec![0u8; scratch_len];
-    let mut colors_used = vec![false; palette_len];
+    let Bands { sixels, colors_used } = bands;
+    sixels.clear();
+    sixels.resize(scratch_len, 0);
+    colors_used.clear();
+    colors_used.resize(palette_len, false);
 
-    for band in 0..bands {
+    for band in 0..band_count {
         let y0 = band * 6;
         let y_max = usize::min(y0 + 6, height);
 
@@ -378,7 +546,7 @@ fn encode_indexed_to_sixel(
 
             // Select color map register
             out.push('#');
-            write_number(&mut out, color_index);
+            write_number(out, color_index);
 
             let row = &sixels[color_index * width..(color_index + 1) * width];
             let mut x = 0;
@@ -394,7 +562,7 @@ fn encode_indexed_to_sixel(
                 // Write RLE or raw sixels
                 if run_len > 3 {
                     out.push('!');
-                    write_number(&mut out, run_len);
+                    write_number(out, run_len);
                     out.push((63 + bits) as char);
                 } else {
                     let ch = (63 + bits) as char;
@@ -417,7 +585,7 @@ fn encode_indexed_to_sixel(
     out.push('\x1b');
     out.push('\\');
 
-    Ok(out)
+    Ok(())
 }
 
 /// Fast number to string without allocation
@@ -444,6 +612,17 @@ fn write_number(out: &mut String, mut n: usize) {
 mod tests {
     use super::*;
 
+    /// Run [`map_visible_pixels`] over `colors` and return the indices.
+    fn map(colors: &[Oklab], mask: &BitMask, width: usize, color_map: &NearestNeighborColorMap<Oklab, f32, 3>, diffusion: f32) -> Vec<u8> {
+        let mut dither = Dither {
+            colors: colors.to_vec(),
+            ..Default::default()
+        };
+        let mut indices = vec![0; colors.len()];
+        map_visible_pixels(&mut dither, mask, width, color_map, diffusion, &mut indices);
+        indices
+    }
+
     #[test]
     fn transparent_pixels_stop_error_diffusion() {
         let palette = quantette::PaletteBuf::new(vec![Oklab::new(0.0, 0.0, 0.0), Oklab::new(1.0, 0.0, 0.0)]).unwrap();
@@ -455,7 +634,7 @@ mod tests {
             for i in visible {
                 mask.set(i);
             }
-            let indices = map_visible_pixels(&colors, &mask, width, &color_map, 1.0);
+            let indices = map(&colors, &mask, width, &color_map, 1.0);
             for i in visible {
                 assert_eq!(indices[i], 0, "error must not cross transparent pixels");
             }
@@ -470,8 +649,8 @@ mod tests {
         let mut mask = BitMask::zeros(3);
         mask.set(0);
         mask.set(1);
-        assert_eq!(map_visible_pixels(&colors, &mask, 3, &color_map, 0.0), [0, 0, 0]);
-        assert_eq!(map_visible_pixels(&colors, &mask, 3, &color_map, 1.0), [0, 1, 0]);
+        assert_eq!(map(&colors, &mask, 3, &color_map, 0.0), [0, 0, 0]);
+        assert_eq!(map(&colors, &mask, 3, &color_map, 1.0), [0, 1, 0]);
     }
 
     #[test]
