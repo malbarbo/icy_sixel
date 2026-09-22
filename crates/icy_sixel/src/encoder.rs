@@ -138,9 +138,9 @@ pub(crate) fn sixel_encode_impl(
         .with_options(opts.clone())
         .with_aspect_ratio(pixel_aspect_ratio)
         .with_background_mode(background_mode);
-    let mut out = String::new();
+    let mut out = Vec::new();
     encoder.encode_into(rgba, width, height, &mut out)?;
-    Ok(out)
+    Ok(String::from_utf8(out).expect("the encoder writes ASCII"))
 }
 
 /// An encoder that reuses its buffers from one image to the next.
@@ -149,22 +149,24 @@ pub(crate) fn sixel_encode_impl(
 /// allocate the scratch buffers and the output string on every call. A program
 /// that encodes a stream of frames, such as a terminal animation or a video
 /// player, keeps one `SixelEncoder` and calls [`encode_into`](Self::encode_into)
-/// with a string it owns, so consecutive frames of the same size allocate
-/// nothing in the encoder.
+/// with a byte buffer it owns, so consecutive frames of the same size allocate
+/// nothing in the encoder. The bytes go to the terminal as they are.
 ///
 /// # Example
 /// ```rust
+/// use std::io::Write;
+///
 /// use icy_sixel::SixelEncoder;
 ///
 /// let mut encoder = SixelEncoder::new();
-/// let mut out = String::new();
+/// let mut out = Vec::new();
 /// for red in [0u8, 128, 255] {
 ///     let rgba = [red, 0, 0, 255];
 ///     out.clear();
 ///     encoder.encode_into(&rgba, 1, 1, &mut out)?;
-///     print!("{out}");
+///     std::io::stdout().write_all(&out)?;
 /// }
-/// # Ok::<(), icy_sixel::SixelError>(())
+/// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 #[derive(Clone, Debug, Default)]
 pub struct SixelEncoder {
@@ -206,7 +208,7 @@ impl SixelEncoder {
     /// `rgba` holds 4 bytes per pixel and `width` by `height` pixels. A pixel
     /// with alpha below 128 is transparent, as in [`sixel_encode`]. An error
     /// leaves `out` with the contents it had.
-    pub fn encode_into(&mut self, rgba: &[u8], width: usize, height: usize, out: &mut String) -> Result<()> {
+    pub fn encode_into(&mut self, rgba: &[u8], width: usize, height: usize, out: &mut Vec<u8>) -> Result<()> {
         let written = out.len();
         let result = self.append(rgba, width, height, out);
         if result.is_err() {
@@ -215,7 +217,7 @@ impl SixelEncoder {
         result
     }
 
-    fn append(&mut self, rgba: &[u8], width: usize, height: usize, out: &mut String) -> Result<()> {
+    fn append(&mut self, rgba: &[u8], width: usize, height: usize, out: &mut Vec<u8>) -> Result<()> {
         crate::validate_encode_dimensions(width, height)?;
         let expected = width.checked_mul(height).and_then(|v| v.checked_mul(4)).ok_or(SixelError::IntegerOverflow)?;
         if rgba.len() != expected {
@@ -451,7 +453,7 @@ pub fn sixel_encode_default(rgba: &[u8], width: usize, height: usize) -> Result<
     sixel_encode(rgba, width, height, &EncodeOptions::default())
 }
 
-fn encode_indexed_to_sixel(palette: &[Rgb], indices: &[u8], opacity_mask: &BitMask, header: Header, bands: &mut Bands, out: &mut String) -> Result<()> {
+fn encode_indexed_to_sixel(palette: &[Rgb], indices: &[u8], opacity_mask: &BitMask, header: Header, bands: &mut Bands, out: &mut Vec<u8>) -> Result<()> {
     let Header {
         width,
         height,
@@ -460,23 +462,23 @@ fn encode_indexed_to_sixel(palette: &[Rgb], indices: &[u8], opacity_mask: &BitMa
     } = header;
     // DCS introducer for SIXEL: ESC P p1 ; p2 ; p3 q
     // p1=aspect ratio, p2=background mode, p3=0 (grid size default)
-    out.push_str("\x1bP");
+    out.extend_from_slice(b"\x1bP");
     write_number(out, aspect_ratio.to_p1_value() as usize);
-    out.push(';');
+    out.push(b';');
     write_number(out, background_mode.to_p2_value() as usize);
-    out.push_str(";0q");
+    out.extend_from_slice(b";0q");
 
     // Set raster attributes: " Pan ; Pad ; Ph ; Pv
     // Pan:Pad is vertical:horizontal, so it mirrors the P1 macro parameter.
     // Emitting this is required for terminals and multiplexers (e.g. tmux) that
     // drop or rewrite P1 but forward the raster attributes.
-    out.push('"');
+    out.push(b'"');
     write_number(out, aspect_ratio.pad() as usize);
-    out.push(';');
+    out.push(b';');
     write_number(out, aspect_ratio.pan() as usize);
-    out.push(';');
+    out.push(b';');
     write_number(out, width);
-    out.push(';');
+    out.push(b';');
     write_number(out, height);
 
     // Define palette in RGB percent (0-100)
@@ -485,15 +487,15 @@ fn encode_indexed_to_sixel(palette: &[Rgb], indices: &[u8], opacity_mask: &BitMa
         let r = (c.r as u32 * 100 + 127) / 255;
         let g = (c.g as u32 * 100 + 127) / 255;
         let b = (c.b as u32 * 100 + 127) / 255;
-        out.push('#');
+        out.push(b'#');
         write_number(out, i);
-        out.push(';');
-        out.push('2');
-        out.push(';');
+        out.push(b';');
+        out.push(b'2');
+        out.push(b';');
         write_number(out, r as usize);
-        out.push(';');
+        out.push(b';');
         write_number(out, g as usize);
-        out.push(';');
+        out.push(b';');
         write_number(out, b as usize);
     }
 
@@ -545,7 +547,7 @@ fn encode_indexed_to_sixel(palette: &[Rgb], indices: &[u8], opacity_mask: &BitMa
             }
 
             // Select color map register
-            out.push('#');
+            out.push(b'#');
             write_number(out, color_index);
 
             let row = &sixels[color_index * width..(color_index + 1) * width];
@@ -561,11 +563,11 @@ fn encode_indexed_to_sixel(palette: &[Rgb], indices: &[u8], opacity_mask: &BitMa
 
                 // Write RLE or raw sixels
                 if run_len > 3 {
-                    out.push('!');
+                    out.push(b'!');
                     write_number(out, run_len);
-                    out.push((63 + bits) as char);
+                    out.push(63 + bits);
                 } else {
-                    let ch = (63 + bits) as char;
+                    let ch = 63 + bits;
                     for _ in 0..run_len {
                         out.push(ch);
                     }
@@ -574,25 +576,25 @@ fn encode_indexed_to_sixel(palette: &[Rgb], indices: &[u8], opacity_mask: &BitMa
             }
 
             // Carriage return to start of band for next color overlay
-            out.push('$');
+            out.push(b'$');
         }
 
         // Move to next band
-        out.push('-');
+        out.push(b'-');
     }
 
     // String terminator: ESC \
-    out.push('\x1b');
-    out.push('\\');
+    out.push(b'\x1b');
+    out.push(b'\\');
 
     Ok(())
 }
 
 /// Fast number to string without allocation
 #[inline]
-fn write_number(out: &mut String, mut n: usize) {
+fn write_number(out: &mut Vec<u8>, mut n: usize) {
     if n == 0 {
-        out.push('0');
+        out.push(b'0');
         return;
     }
 
@@ -605,7 +607,7 @@ fn write_number(out: &mut String, mut n: usize) {
         n /= 10;
     }
 
-    out.push_str(unsafe { std::str::from_utf8_unchecked(&buf[i..]) });
+    out.extend_from_slice(&buf[i..]);
 }
 
 #[cfg(test)]

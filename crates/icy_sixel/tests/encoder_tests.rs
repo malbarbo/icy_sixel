@@ -106,7 +106,7 @@ fn a_reused_encoder_matches_a_fresh_encode() {
         (1, 1, 255, QuantizeMethod::Wu, 0.875),
     ];
     let mut encoder = SixelEncoder::new();
-    let mut out = String::new();
+    let mut out = Vec::new();
     for (width, height, alpha, quantize_method, diffusion) in frames {
         let mut pixels = Vec::with_capacity(width * height * 4);
         for i in 0..width * height {
@@ -121,17 +121,17 @@ fn a_reused_encoder_matches_a_fresh_encode() {
         encoder = encoder.with_options(opts.clone());
         out.clear();
         encoder.encode_into(&pixels, width, height, &mut out).unwrap();
-        assert_eq!(out, icy_sixel::sixel_encode(&pixels, width, height, &opts).unwrap());
+        assert_eq!(out, icy_sixel::sixel_encode(&pixels, width, height, &opts).unwrap().into_bytes());
     }
 }
 
 #[test]
 fn encode_into_appends_and_keeps_out_on_an_error() {
     let mut encoder = SixelEncoder::new();
-    let mut out = String::from("prefix");
+    let mut out = b"prefix".to_vec();
     encoder.encode_into(&[255, 0, 0, 255], 1, 1, &mut out).unwrap();
     let one = out.clone();
-    assert!(one.starts_with("prefix\x1bP"));
+    assert!(one.starts_with(b"prefix\x1bP"));
 
     assert!(matches!(
         encoder.encode_into(&[255, 0, 0], 1, 1, &mut out),
@@ -141,5 +141,5 @@ fn encode_into_appends_and_keeps_out_on_an_error() {
 
     // A second image appends to the first.
     encoder.encode_into(&[0, 0, 255, 255], 1, 1, &mut out).unwrap();
-    assert_eq!(out.matches('\x1b').count(), 4);
+    assert_eq!(out.iter().filter(|&&b| b == 0x1b).count(), 4);
 }

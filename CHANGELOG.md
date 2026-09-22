@@ -9,9 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - `SixelEncoder`, an encoder that keeps its scratch buffers from one image to the next and appends the
-	result to a caller-owned `String` through `encode_into()`. Encoding a stream of same-sized frames now
-	allocates only inside the quantizer, which cuts a 800x600 frame from 30 to 7 allocations and from
-	10.1 MiB to 6.4 MiB of allocated memory.
+	result to a caller-owned `Vec<u8>` through `encode_into()`, ready to write to the terminal. Encoding a
+	stream of same-sized frames now allocates only inside the quantizer, which cuts a 800x600 frame from 30
+	to 7 allocations and from 10.1 MiB to 6.4 MiB of allocated memory.
 
 ### Changed
 - `sixel_encode()` and `SixelImage::encode()` run through `SixelEncoder`, and the opaque path reads the
