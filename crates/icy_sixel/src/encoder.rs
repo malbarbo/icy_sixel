@@ -241,8 +241,7 @@ impl SixelEncoder {
         }
 
         // Set up quantette pipeline
-        let max_colors = self.options.max_colors.clamp(2, 256) as u8;
-        let palette_size = PaletteSize::try_from(max_colors).unwrap_or(PaletteSize::MAX);
+        let palette_size = PaletteSize::from_u16_clamped(self.options.max_colors.max(2));
 
         // Use configured quantization method with diffusion-based dithering
         let diffusion = self.options.diffusion.clamp(0.0, 1.0);

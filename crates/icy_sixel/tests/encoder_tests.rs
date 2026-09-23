@@ -55,6 +55,28 @@ fn transparent_pixels_do_not_consume_palette_colors() {
 }
 
 #[test]
+fn max_colors_clamps_to_2_through_256() {
+    // Seven levels per channel give 343 distinct colors, more than the largest palette.
+    let pixels: Vec<u8> = (0..343u16)
+        .flat_map(|i| [i % 7 * 40, i / 7 % 7 * 40, i / 49 * 40, 255].map(|c| c as u8))
+        .collect();
+    let image = SixelImage::try_from_rgba(pixels, 343, 1).unwrap();
+    let encode = |max_colors| {
+        let options = EncodeOptions {
+            max_colors,
+            diffusion: 0.0,
+            ..Default::default()
+        };
+        image.encode_with(&options).unwrap()
+    };
+    assert_eq!(encode(2).matches(";2;").count(), 2);
+    assert_eq!(encode(0), encode(2));
+    assert_eq!(encode(1), encode(2));
+    assert_eq!(encode(256).matches(";2;").count(), 256);
+    assert_eq!(encode(300), encode(256));
+}
+
+#[test]
 fn hidden_rgb_does_not_change_encoded_output() {
     let (width, height) = (17, 12);
     let mut first = Vec::new();
