@@ -285,3 +285,22 @@ fn an_encoder_switches_between_an_exact_palette_and_the_quantizer() {
         assert_eq!(encode(&mut encoder, rgba, width, height), encode(&mut exact(256), rgba, width, height));
     }
 }
+
+#[test]
+fn a_color_in_a_few_columns_decodes_in_place() {
+    // Red sits past the repeat limit of one run, and blue fills two short
+    // stretches, so each color starts after an empty run and stops short
+    // of the row end. The second row of the band holds blue further left
+    // than the first row does.
+    let width = 70_000;
+    let mut top = vec![[255, 255, 255]; width];
+    top[5..8].fill([0, 0, 255]);
+    top[12] = [0, 0, 255];
+    top[66_000..66_004].fill([255, 0, 0]);
+    let mut bottom = vec![[255, 255, 255]; width];
+    bottom[2] = [0, 0, 255];
+    let rgba = [row_of(&top), row_of(&bottom)].concat();
+    let encoded = encode(&mut exact(256), &rgba, width, 2);
+    let decoded = SixelImage::decode(encoded.as_bytes()).unwrap();
+    assert_eq!(&decoded.pixels[..rgba.len()], rgba.as_slice());
+}

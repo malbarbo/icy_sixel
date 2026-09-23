@@ -354,8 +354,9 @@ struct Header {
 struct Bands {
     /// The 6-bit sixel value of every (color, column) pair in the band.
     sixels: Vec<u8>,
-    /// Whether the color appears in the band.
-    colors_used: Vec<bool>,
+    /// The first and one past the last column of the color in the band, or
+    /// `None` when the color does not appear in it.
+    spans: Vec<Option<(usize, usize)>>,
 }
 
 /// The buffers of [`map_visible_pixels`].
@@ -600,21 +601,20 @@ fn encode_indexed_to_sixel(palette: &[Rgb], indices: &[u8], opacity_mask: &BitMa
     // fits, since the palette holds at most 256 colors and the width is at most
     // SIXEL_WIDTH_LIMIT.
     let scratch_len = palette_len * width;
-    let Bands { sixels, colors_used } = bands;
+    let Bands { sixels, spans } = bands;
     sixels.clear();
     sixels.resize(scratch_len, 0);
-    colors_used.clear();
-    colors_used.resize(palette_len, false);
+    spans.clear();
+    spans.resize(palette_len, None);
 
     for band in 0..band_count {
         let y0 = band * 6;
         let y_max = usize::min(y0 + 6, height);
 
         // Reset only the rows touched by the previous band.
-        for (color_index, used) in colors_used.iter_mut().enumerate() {
-            if *used {
-                sixels[color_index * width..(color_index + 1) * width].fill(0);
-                *used = false;
+        for (color_index, span) in spans.iter_mut().enumerate() {
+            if let Some((start, end)) = span.take() {
+                sixels[color_index * width + start..color_index * width + end].fill(0);
             }
         }
 
@@ -629,29 +629,36 @@ fn encode_indexed_to_sixel(palette: &[Rgb], indices: &[u8], opacity_mask: &BitMa
                 if opacity_mask.get(pixel_idx) {
                     let color_index = indices[pixel_idx] as usize;
                     sixels[color_index * width + x] |= bit;
-                    colors_used[color_index] = true;
+                    let span = &mut spans[color_index];
+                    *span = Some(match *span {
+                        Some((start, end)) => (start.min(x), end.max(x + 1)),
+                        None => (x, x + 1),
+                    });
                 }
             }
         }
 
         // Emit each used color, run-length encoding consecutive identical sixels.
-        for color_index in 0..palette_len {
-            if !colors_used[color_index] {
-                continue; // Skip colors not used in this band
-            }
+        for (color_index, span) in spans.iter().enumerate() {
+            let Some((start, end)) = *span else {
+                continue;
+            };
 
             // Select color map register
             out.push(b'#');
             write_number(out, color_index);
 
-            let row = &sixels[color_index * width..(color_index + 1) * width];
-            let mut x = 0;
-            while x < width {
+            // The columns before the span are empty, and the ones after it
+            // need nothing, since the next color starts again at column 0.
+            write_empty_run(out, start);
+            let row = &sixels[color_index * width..color_index * width + end];
+            let mut x = start;
+            while x < end {
                 let bits = row[x];
 
                 // Run-length encode consecutive identical sixel values
                 let mut run_len = 1usize;
-                while run_len < SIXEL_REPEAT_MAX && x + run_len < width && row[x + run_len] == bits {
+                while run_len < SIXEL_REPEAT_MAX && x + run_len < end && row[x + run_len] == bits {
                     run_len += 1;
                 }
 
@@ -680,6 +687,21 @@ fn encode_indexed_to_sixel(palette: &[Rgb], indices: &[u8], opacity_mask: &BitMa
     // String terminator: ESC \
     out.push(b'\x1b');
     out.push(b'\\');
+}
+
+/// Write `len` empty sixels.
+fn write_empty_run(out: &mut Vec<u8>, mut len: usize) {
+    while len > 0 {
+        let run = len.min(SIXEL_REPEAT_MAX);
+        if run > 3 {
+            out.push(b'!');
+            write_number(out, run);
+            out.push(b'?');
+        } else {
+            out.extend(std::iter::repeat_n(b'?', run));
+        }
+        len -= run;
+    }
 }
 
 /// Fast number to string without allocation
