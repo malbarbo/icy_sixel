@@ -3,13 +3,16 @@
 //! This encoder uses the quantette library (MIT/Apache licensed) for optimal
 //! color palette generation and dithering, then encodes the result to SIXEL format.
 
+use std::num::NonZeroU32;
+
 use crate::{BackgroundMode, PixelAspectRatio, Result, SixelError, SIXEL_REPEAT_MAX};
 use quantette::{
     color_map::{IndexedColorMap, NearestNeighborColorMap},
     color_space::{oklab_to_srgb8, srgb8_to_oklab},
     deps::palette::{Oklab, Srgb},
     dither::FloydSteinberg,
-    ImageRef, PaletteSize, Pipeline,
+    wu::{BinnerF32x3, WuF32x3},
+    ImageRef, PaletteCounts, PaletteSize, Pipeline,
 };
 
 // Re-export QuantizeMethod for public API
@@ -251,6 +254,21 @@ impl SixelEncoder {
             return Ok(());
         }
 
+        let diffusion = self.options.diffusion.clamp(0.0, 1.0);
+        let wu = matches!(self.options.quantize_method, QuantizeMethod::Wu);
+        if diffusion <= 0.0 && wu && count_opaque_colors(rgba, scratch) {
+            quantize_counted_colors(scratch, palette_size);
+            let Scratch {
+                palette,
+                indices,
+                opacity_mask,
+                bands,
+                ..
+            } = scratch;
+            encode_indexed_to_sixel(palette, indices, opacity_mask, header, bands, out);
+            return Ok(());
+        }
+
         // Single pass over the RGBA buffer building both the transparency mask
         // (set bit = opaque) and the Srgb<u8> pixels used for quantization
         // (quantette uses palette crate types).
@@ -268,7 +286,6 @@ impl SixelEncoder {
         }
 
         // Use configured quantization method with diffusion-based dithering
-        let diffusion = self.options.diffusion.clamp(0.0, 1.0);
         let pipeline = Pipeline::new().palette_size(palette_size).quantize_method(self.options.quantize_method.clone());
 
         if opaque_count != pixel_count {
@@ -289,10 +306,10 @@ impl SixelEncoder {
 
         // Apply dithering based on diffusion setting
         let indexed_image = if diffusion <= 0.0 {
-            // No dithering - sharp edges, may show banding. Quantette only
-            // dedups the pixels of an image over 4 Mpx by itself. A drawing
-            // repeats few colors, so the dedup costs less than the conversion
-            // of every pixel to Oklab that it saves.
+            // No dithering - sharp edges, may show banding. Quantette dedups
+            // the pixels by itself only for a large image. A drawing repeats
+            // few colors, so the dedup costs less than the conversion of every
+            // pixel to Oklab that it saves.
             pipeline.ditherer(None).dedup(true).input_image(image).output_srgb8_indexed_image()
         } else {
             // Use Floyd-Steinberg dithering with specified diffusion strength
@@ -334,6 +351,8 @@ struct Scratch {
     /// The hash table of [`index_exact_colors`]. Each slot holds the palette
     /// index of a color, or `None`.
     slots: Vec<Option<u8>>,
+    /// The buffers of [`count_opaque_colors`].
+    counted: Counted,
     /// The buffers of the band loop.
     bands: Bands,
     /// The buffers of the masked dithering.
@@ -357,6 +376,21 @@ struct Bands {
     /// The first and one past the last column of the color in the band, or
     /// `None` when the color does not appear in it.
     spans: Vec<Option<(usize, usize)>>,
+}
+
+/// The distinct colors of an image, which [`count_opaque_colors`] fills.
+#[derive(Clone, Debug, Default)]
+struct Counted {
+    /// A hash table. Each slot holds one more than the index of a color in
+    /// `colors`, or `None`. The length is a power of two, and at most half of
+    /// the slots hold a color.
+    slots: Vec<Option<NonZeroU32>>,
+    /// The distinct colors, in the order of their first pixel.
+    colors: Vec<Srgb<u8>>,
+    /// The number of pixels of each color in `colors`.
+    counts: Vec<u32>,
+    /// The index in `colors` of the color of every pixel.
+    pixels: Vec<u32>,
 }
 
 /// The buffers of [`map_visible_pixels`].
@@ -420,9 +454,7 @@ fn index_exact_colors(rgba: &[u8], budget: usize, scratch: &mut Scratch) -> bool
 /// Returns `None` if the color is new and the palette already holds `budget`
 /// colors.
 fn find_or_insert(slots: &mut [Option<u8>], palette: &mut Vec<Rgb>, color: Rgb, budget: usize) -> Option<u8> {
-    let key = u32::from_be_bytes([0, color.r, color.g, color.b]);
-    // Fibonacci hashing takes the top bits of the product, which mix every channel.
-    let mut slot = (key.wrapping_mul(0x9E37_79B1) >> (32 - SLOTS.trailing_zeros())) as usize;
+    let mut slot = fibonacci_slot([color.r, color.g, color.b], SLOTS);
     loop {
         match slots[slot] {
             None => {
@@ -438,6 +470,122 @@ fn find_or_insert(slots: &mut [Option<u8>], palette: &mut Vec<Rgb>, color: Rgb, 
             _ => slot = (slot + 1) % SLOTS,
         }
     }
+}
+
+/// The number of slots of the table of [`count_opaque_colors`] at the start
+/// of every image. The table grows for an image of more colors.
+const MIN_COUNTED_SLOTS: usize = 4096;
+
+/// Returns `true` if every pixel is opaque, `false` otherwise. On `true`,
+/// `scratch.counted` holds the distinct colors of the image, the number of
+/// pixels of each one and the color of every pixel, and `scratch.opacity_mask`
+/// has every bit set.
+///
+/// Quantette finds the distinct colors with a radix sort of a copy of the
+/// pixels. A hash table finds them in one pass over `rgba`, and a run of
+/// pixels of one color skips the table. A transparent pixel stops the pass,
+/// so an image with one near the end costs a pass for nothing.
+fn count_opaque_colors(rgba: &[u8], scratch: &mut Scratch) -> bool {
+    let Scratch { opacity_mask, counted, .. } = scratch;
+    let pixels = rgba.as_chunks::<4>().0;
+    opacity_mask.reset(pixels.len());
+    counted.slots.clear();
+    counted.slots.resize(MIN_COUNTED_SLOTS, None);
+    counted.colors.clear();
+    counted.counts.clear();
+    counted.pixels.clear();
+    counted.pixels.reserve(pixels.len());
+    let mut last: Option<([u8; 3], u32)> = None;
+    for (i, c) in pixels.iter().enumerate() {
+        if c[3] < 128 {
+            return false;
+        }
+        opacity_mask.set(i);
+        let color = [c[0], c[1], c[2]];
+        let index = match last {
+            Some((last_color, index)) if last_color == color => index,
+            _ => counted.find_or_insert(color),
+        };
+        last = Some((color, index));
+        counted.counts[index as usize] += 1;
+        counted.pixels.push(index);
+    }
+    true
+}
+
+impl Counted {
+    /// Returns the index of `color` in `colors`, which joins `colors` with a
+    /// count of zero if it is new.
+    fn find_or_insert(&mut self, [r, g, b]: [u8; 3]) -> u32 {
+        let color = Srgb::new(r, g, b);
+        let mut slot = self.slot_of(color);
+        loop {
+            match self.slots[slot] {
+                None => break,
+                Some(slot) if self.colors[slot.get() as usize - 1] == color => return slot.get() - 1,
+                Some(_) => slot = (slot + 1) & (self.slots.len() - 1),
+            }
+        }
+        let index = u32::try_from(self.colors.len()).expect("an image has at most 2^26 pixels");
+        self.slots[slot] = NonZeroU32::new(index + 1);
+        self.colors.push(color);
+        self.counts.push(0);
+        if self.colors.len() * 2 > self.slots.len() {
+            self.grow();
+        }
+        index
+    }
+
+    /// Double the slots and put every color back.
+    fn grow(&mut self) {
+        let len = self.slots.len() * 2;
+        self.slots.clear();
+        self.slots.resize(len, None);
+        let mask = self.slots.len() - 1;
+        for (index, &color) in (1..).zip(&self.colors) {
+            let mut slot = self.slot_of(color);
+            while self.slots[slot].is_some() {
+                slot = (slot + 1) & mask;
+            }
+            self.slots[slot] = NonZeroU32::new(index);
+        }
+    }
+
+    /// The first slot to try for `color`.
+    fn slot_of(&self, color: Srgb<u8>) -> usize {
+        fibonacci_slot([color.red, color.green, color.blue], self.slots.len())
+    }
+}
+
+/// The first slot to try for `rgb` in a hash table of `len` slots, a power of
+/// two. Fibonacci hashing takes the top bits of the product, which mix every
+/// channel.
+fn fibonacci_slot(rgb: [u8; 3], len: usize) -> usize {
+    let [r, g, b] = rgb;
+    let key = u32::from_be_bytes([0, r, g, b]);
+    (key.wrapping_mul(0x9E37_79B1) >> (32 - len.trailing_zeros())) as usize
+}
+
+/// Quantize the colors of `scratch.counted` with Wu, and leave the result in
+/// `scratch.palette` and `scratch.indices`. Wu weighs each distinct color by
+/// its count, so the palette is the one of Wu over every pixel, up to the
+/// order of the float sums of its histogram.
+fn quantize_counted_colors(scratch: &mut Scratch, palette_size: PaletteSize) {
+    let Scratch { palette, indices, counted, .. } = scratch;
+    let oklab = srgb8_to_oklab(&counted.colors);
+    let palette_counts = PaletteCounts::new(oklab, counted.counts.clone()).expect("an image has at most 2^26 pixels");
+    let color_map = WuF32x3::run_palette_counts(&palette_counts, BinnerF32x3::oklab_from_srgb8())
+        .expect("an image has a pixel")
+        .color_map(palette_size);
+    let palette_indices = color_map.map_to_indices(palette_counts.palette());
+    indices.clear();
+    indices.extend(counted.pixels.iter().map(|&color| palette_indices[color as usize]));
+    palette.clear();
+    palette.extend(oklab_to_srgb8(color_map.palette()).into_iter().map(|c| Rgb {
+        r: c.red,
+        g: c.green,
+        b: c.blue,
+    }));
 }
 
 /// Quantette has no alpha-mask support. Train its palette only on visible pixels,
@@ -727,6 +875,109 @@ fn write_number(out: &mut Vec<u8>, mut n: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn opaque(colors: &[[u8; 3]]) -> Vec<u8> {
+        colors.iter().flat_map(|&[r, g, b]| [r, g, b, 255]).collect()
+    }
+
+    /// 128 by 64 pixels of 8192 colors, one per pixel.
+    fn gradient() -> Vec<[u8; 3]> {
+        (0..128 * 64).map(|i| [(i % 128) as u8 * 2, (i / 128) as u8 * 4, (i * 7) as u8]).collect()
+    }
+
+    fn encode(encoder: &mut SixelEncoder, colors: &[[u8; 3]]) -> String {
+        let mut out = Vec::new();
+        encoder.encode_into(&opaque(colors), 128, 64, &mut out).unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn counted_colors_quantize_as_the_pipeline_does() {
+        // 5038 colors of 1 to over 8 pixels each, which grow the table twice.
+        let (width, height) = (128, 128);
+        let gradient = gradient();
+        let colors: Vec<[u8; 3]> = (0..width * height).map(|i| gradient[i * i / 7 % 8192]).collect();
+        let size = PaletteSize::from_u16_clamped(256);
+        let pixels: Vec<Srgb<u8>> = colors.iter().map(|&[r, g, b]| Srgb::new(r, g, b)).collect();
+        let image = ImageRef::new(width as u32, height as u32, &pixels).unwrap();
+        let expected = Pipeline::new()
+            .palette_size(size)
+            .ditherer(None)
+            .dedup(true)
+            .input_image(image)
+            .output_srgb8_indexed_image();
+        let expected: Vec<Srgb<u8>> = expected.indices().iter().map(|&i| expected.palette()[usize::from(i)]).collect();
+
+        let mut scratch = Scratch::default();
+        assert!(count_opaque_colors(&opaque(&colors), &mut scratch));
+        quantize_counted_colors(&mut scratch, size);
+        let got: Vec<Srgb<u8>> = scratch
+            .indices
+            .iter()
+            .map(|&i| {
+                let c = scratch.palette[usize::from(i)];
+                Srgb::new(c.r, c.g, c.b)
+            })
+            .collect();
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn counted_colors_hold_each_color_once_with_its_pixels() {
+        let (a, b) = ([1, 2, 3], [4, 5, 6]);
+        let mut scratch = Scratch::default();
+        assert!(count_opaque_colors(&opaque(&[a, a, b, a]), &mut scratch));
+        let counted = &scratch.counted;
+        assert_eq!(counted.colors, [Srgb::new(1, 2, 3), Srgb::new(4, 5, 6)]);
+        assert_eq!(counted.counts, [3, 1]);
+        assert_eq!(counted.pixels, [0, 0, 1, 0]);
+        assert!((0..4).all(|i| scratch.opacity_mask.get(i)));
+    }
+
+    #[test]
+    fn a_reused_table_counts_the_next_image_alone() {
+        let (a, b) = ([1, 2, 3], [4, 5, 6]);
+        let mut scratch = Scratch::default();
+        let mut first = gradient();
+        first.push(a);
+        assert!(count_opaque_colors(&opaque(&first), &mut scratch));
+        assert!(count_opaque_colors(&opaque(&[b, b]), &mut scratch));
+        assert_eq!(scratch.counted.colors, [Srgb::new(4, 5, 6)]);
+        assert_eq!(scratch.counted.counts, [2]);
+        assert_eq!(scratch.counted.pixels, [0, 0]);
+    }
+
+    #[test]
+    fn dithering_goes_on_past_256_colors() {
+        let colors = gradient();
+        let with = |diffusion| {
+            let options = EncodeOptions {
+                diffusion,
+                ..Default::default()
+            };
+            encode(&mut SixelEncoder::new().with_options(options), &colors)
+        };
+        assert_ne!(with(0.0), with(0.875));
+    }
+
+    #[test]
+    fn a_custom_palette_without_dithering_keeps_its_colors() {
+        let black_and_white = quantette::PaletteBuf::new(vec![Srgb::new(0, 0, 0), Srgb::new(255, 255, 255)]).unwrap();
+        let options = EncodeOptions {
+            diffusion: 0.0,
+            quantize_method: black_and_white.into(),
+            ..Default::default()
+        };
+        let encoded = encode(&mut SixelEncoder::new().with_options(options), &gradient());
+        assert_eq!(encoded.matches(";2;").count(), 2, "{encoded}");
+    }
+
+    #[test]
+    fn a_transparent_pixel_stops_the_count() {
+        let mut rgba = opaque(&[[1, 2, 3], [4, 5, 6]]);
+        rgba[7] = 0;
+        assert!(!count_opaque_colors(&rgba, &mut Scratch::default()));
+    }
 
     /// Run [`map_visible_pixels`] over `colors` and return the indices.
     fn map(colors: &[Oklab], mask: &BitMask, width: usize, color_map: &NearestNeighborColorMap<Oklab, f32, 3>, diffusion: f32) -> Vec<u8> {
