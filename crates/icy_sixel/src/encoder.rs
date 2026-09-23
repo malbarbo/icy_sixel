@@ -354,10 +354,7 @@ struct Scratch {
     /// the encoder takes the exact palette. An opaque image that goes through quantette reads the
     /// indices of the quantette image in place.
     indices: Vec<u8>,
-    /// The hash table of [`index_exact_colors`]. Each slot holds the palette
-    /// index of a color, or `None`.
-    slots: Vec<Option<u8>>,
-    /// The buffers of [`count_opaque_colors`].
+    /// The buffers of [`index_exact_colors`] and [`count_opaque_colors`].
     counted: Counted,
     /// The buffers of the band loop.
     bands: Bands,
@@ -384,7 +381,8 @@ struct Bands {
     spans: Vec<Option<(usize, usize)>>,
 }
 
-/// The distinct colors of an image, which [`count_opaque_colors`] fills.
+/// The distinct colors of an image, which [`index_exact_colors`] and
+/// [`count_opaque_colors`] fill.
 #[derive(Clone, Debug, Default)]
 struct Counted {
     /// A hash table. Each slot holds one more than the index of a color in
@@ -395,7 +393,8 @@ struct Counted {
     colors: Vec<Srgb<u8>>,
     /// The number of pixels of each color in `colors`.
     counts: Vec<u32>,
-    /// The index in `colors` of the color of every pixel.
+    /// The index in `colors` of the color of every pixel. Only
+    /// [`count_opaque_colors`] fills it and `counts`.
     pixels: Vec<u32>,
 }
 
@@ -411,10 +410,6 @@ struct Dither {
     next: Vec<[f32; 3]>,
 }
 
-/// The size of the hash table of [`index_exact_colors`]. It is a power of two,
-/// and with at most 256 colors it stays at most half full.
-const SLOTS: usize = 512;
-
 /// Returns `true` if the colors of the opaque pixels fit in `budget`, `false`
 /// otherwise. On `true`, `scratch.palette` holds those colors,
 /// `scratch.indices` the index of the color of every opaque pixel and
@@ -425,7 +420,7 @@ fn index_exact_colors(rgba: &[u8], budget: usize, scratch: &mut Scratch) -> bool
         opacity_mask,
         palette,
         indices,
-        slots,
+        counted,
         ..
     } = scratch;
     let pixels = rgba.as_chunks::<4>().0;
@@ -433,53 +428,38 @@ fn index_exact_colors(rgba: &[u8], budget: usize, scratch: &mut Scratch) -> bool
     palette.clear();
     indices.clear();
     indices.resize(pixels.len(), 0);
-    slots.clear();
-    slots.resize(SLOTS, None);
+    counted.clear();
     // A run of pixels of one color skips the table.
-    let mut last: Option<(Rgb, u8)> = None;
+    let mut last: Option<([u8; 3], u8)> = None;
     for (i, c) in pixels.iter().enumerate() {
         if c[3] < 128 {
             continue;
         }
         opacity_mask.set(i);
-        let color = Rgb { r: c[0], g: c[1], b: c[2] };
+        let color = [c[0], c[1], c[2]];
         let index = match last {
             Some((last_color, index)) if last_color == color => index,
-            _ => match find_or_insert(slots, palette, color, budget) {
-                Some(index) => index,
-                None => return false,
-            },
+            _ => {
+                let index = counted.find_or_insert(color);
+                if counted.colors.len() > budget {
+                    return false;
+                }
+                u8::try_from(index).expect("the budget is at most 256")
+            }
         };
         last = Some((color, index));
         indices[i] = index;
     }
+    palette.extend(counted.colors.iter().map(|c| Rgb {
+        r: c.red,
+        g: c.green,
+        b: c.blue,
+    }));
     true
 }
 
-/// Returns the palette index of `color`, which joins the palette if it is new.
-/// Returns `None` if the color is new and the palette already holds `budget`
-/// colors.
-fn find_or_insert(slots: &mut [Option<u8>], palette: &mut Vec<Rgb>, color: Rgb, budget: usize) -> Option<u8> {
-    let mut slot = fibonacci_slot([color.r, color.g, color.b], SLOTS);
-    loop {
-        match slots[slot] {
-            None => {
-                if palette.len() == budget {
-                    return None;
-                }
-                let index = u8::try_from(palette.len()).expect("the budget is at most 256");
-                slots[slot] = Some(index);
-                palette.push(color);
-                return Some(index);
-            }
-            Some(index) if palette[usize::from(index)] == color => return Some(index),
-            _ => slot = (slot + 1) % SLOTS,
-        }
-    }
-}
-
-/// The number of slots of the table of [`count_opaque_colors`] at the start
-/// of every image. The table grows for an image of more colors.
+/// The number of slots of the table of [`Counted`] at the start of every
+/// image. The table grows for an image of more colors.
 const MIN_COUNTED_SLOTS: usize = 4096;
 
 /// Returns `true` if every pixel is opaque, `false` otherwise. On `true`,
@@ -495,11 +475,7 @@ fn count_opaque_colors(rgba: &[u8], scratch: &mut Scratch) -> bool {
     let Scratch { opacity_mask, counted, .. } = scratch;
     let pixels = rgba.as_chunks::<4>().0;
     opacity_mask.reset(pixels.len());
-    counted.slots.clear();
-    counted.slots.resize(MIN_COUNTED_SLOTS, None);
-    counted.colors.clear();
-    counted.counts.clear();
-    counted.pixels.clear();
+    counted.clear();
     counted.pixels.reserve(pixels.len());
     let mut last: Option<([u8; 3], u32)> = None;
     for (i, c) in pixels.iter().enumerate() {
@@ -520,6 +496,15 @@ fn count_opaque_colors(rgba: &[u8], scratch: &mut Scratch) -> bool {
 }
 
 impl Counted {
+    /// Empty the table and the colors.
+    fn clear(&mut self) {
+        self.slots.clear();
+        self.slots.resize(MIN_COUNTED_SLOTS, None);
+        self.colors.clear();
+        self.counts.clear();
+        self.pixels.clear();
+    }
+
     /// Returns the index of `color` in `colors`, which joins `colors` with a
     /// count of zero if it is new.
     fn find_or_insert(&mut self, [r, g, b]: [u8; 3]) -> u32 {
