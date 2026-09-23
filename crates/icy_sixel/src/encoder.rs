@@ -289,8 +289,11 @@ impl SixelEncoder {
 
         // Apply dithering based on diffusion setting
         let indexed_image = if diffusion <= 0.0 {
-            // No dithering - sharp edges, may show banding
-            pipeline.ditherer(None).input_image(image).output_srgb8_indexed_image()
+            // No dithering - sharp edges, may show banding. Quantette only
+            // dedups the pixels of an image over 4 Mpx by itself. A drawing
+            // repeats few colors, so the dedup costs less than the conversion
+            // of every pixel to Oklab that it saves.
+            pipeline.ditherer(None).dedup(true).input_image(image).output_srgb8_indexed_image()
         } else {
             // Use Floyd-Steinberg dithering with specified diffusion strength
             let ditherer = FloydSteinberg::with_error_diffusion(diffusion).unwrap_or_default();
