@@ -16,7 +16,7 @@ use quantette::{
 pub use quantette::QuantizeMethod;
 
 /// Color type for palette entries (RGB).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct Rgb {
     r: u8,
     g: u8,
@@ -171,6 +171,7 @@ pub(crate) fn sixel_encode_impl(
 #[derive(Clone, Debug, Default)]
 pub struct SixelEncoder {
     options: EncodeOptions,
+    exact_palette: bool,
     aspect_ratio: PixelAspectRatio,
     background_mode: BackgroundMode,
     scratch: Scratch,
@@ -186,6 +187,19 @@ impl SixelEncoder {
     #[must_use]
     pub fn with_options(mut self, options: EncodeOptions) -> Self {
         self.options = options;
+        self
+    }
+
+    /// Use the colors of the image as the palette when they fit in
+    /// `max_colors`, and quantize only an image with more colors.
+    ///
+    /// The quantizer merges colors that are close together, so a drawing of
+    /// 21 flat colors can come back with 8. An exact palette keeps every
+    /// color and can make the output longer, since the SIXEL has one run per
+    /// color used in each band. Off by default.
+    #[must_use]
+    pub fn with_exact_palette(mut self, exact_palette: bool) -> Self {
+        self.exact_palette = exact_palette;
         self
     }
 
@@ -223,11 +237,24 @@ impl SixelEncoder {
             background_mode: self.background_mode,
         };
 
+        let palette_size = PaletteSize::from_u16_clamped(self.options.max_colors.max(2));
+        let scratch = &mut self.scratch;
+        if self.exact_palette && index_exact_colors(rgba, palette_size.as_usize(), scratch) {
+            let Scratch {
+                palette,
+                indices,
+                opacity_mask,
+                bands,
+                ..
+            } = scratch;
+            encode_indexed_to_sixel(palette, indices, opacity_mask, header, bands, out);
+            return Ok(());
+        }
+
         // Single pass over the RGBA buffer building both the transparency mask
         // (set bit = opaque) and the Srgb<u8> pixels used for quantization
         // (quantette uses palette crate types).
         let pixel_count = expected / 4;
-        let scratch = &mut self.scratch;
         scratch.opacity_mask.reset(pixel_count);
         scratch.rgb_pixels.clear();
         scratch.rgb_pixels.reserve(pixel_count);
@@ -239,9 +266,6 @@ impl SixelEncoder {
             }
             scratch.rgb_pixels.push(Srgb::new(c[0], c[1], c[2]));
         }
-
-        // Set up quantette pipeline
-        let palette_size = PaletteSize::from_u16_clamped(self.options.max_colors.max(2));
 
         // Use configured quantization method with diffusion-based dithering
         let diffusion = self.options.diffusion.clamp(0.0, 1.0);
@@ -300,9 +324,13 @@ struct Scratch {
     opacity_mask: BitMask,
     /// The quantized palette.
     palette: Vec<Rgb>,
-    /// One palette index per pixel, filled only when the image has transparency.
-    /// An opaque image reads the indices of the quantette image in place.
+    /// One palette index per pixel, filled when the image has transparency or
+    /// the encoder takes the exact palette. An opaque image that goes through quantette reads the
+    /// indices of the quantette image in place.
     indices: Vec<u8>,
+    /// The hash table of [`index_exact_colors`]. Each slot holds the palette
+    /// index of a color, or `None`.
+    slots: Vec<Option<u8>>,
     /// The buffers of the band loop.
     bands: Bands,
     /// The buffers of the masked dithering.
@@ -337,6 +365,75 @@ struct Dither {
     /// The error carried into the row in progress and into the row below it.
     current: Vec<[f32; 3]>,
     next: Vec<[f32; 3]>,
+}
+
+/// The size of the hash table of [`index_exact_colors`]. It is a power of two,
+/// and with at most 256 colors it stays at most half full.
+const SLOTS: usize = 512;
+
+/// Returns `true` if the colors of the opaque pixels fit in `budget`, `false`
+/// otherwise. On `true`, `scratch.palette` holds those colors,
+/// `scratch.indices` the index of the color of every opaque pixel and
+/// `scratch.opacity_mask` the opaque pixels. On `false`, the three buffers hold
+/// a part of the image.
+fn index_exact_colors(rgba: &[u8], budget: usize, scratch: &mut Scratch) -> bool {
+    let Scratch {
+        opacity_mask,
+        palette,
+        indices,
+        slots,
+        ..
+    } = scratch;
+    let pixels = rgba.as_chunks::<4>().0;
+    opacity_mask.reset(pixels.len());
+    palette.clear();
+    indices.clear();
+    indices.resize(pixels.len(), 0);
+    slots.clear();
+    slots.resize(SLOTS, None);
+    // A run of pixels of one color skips the table.
+    let mut last: Option<(Rgb, u8)> = None;
+    for (i, c) in pixels.iter().enumerate() {
+        if c[3] < 128 {
+            continue;
+        }
+        opacity_mask.set(i);
+        let color = Rgb { r: c[0], g: c[1], b: c[2] };
+        let index = match last {
+            Some((last_color, index)) if last_color == color => index,
+            _ => match find_or_insert(slots, palette, color, budget) {
+                Some(index) => index,
+                None => return false,
+            },
+        };
+        last = Some((color, index));
+        indices[i] = index;
+    }
+    true
+}
+
+/// Returns the palette index of `color`, which joins the palette if it is new.
+/// Returns `None` if the color is new and the palette already holds `budget`
+/// colors.
+fn find_or_insert(slots: &mut [Option<u8>], palette: &mut Vec<Rgb>, color: Rgb, budget: usize) -> Option<u8> {
+    let key = u32::from_be_bytes([0, color.r, color.g, color.b]);
+    // Fibonacci hashing takes the top bits of the product, which mix every channel.
+    let mut slot = (key.wrapping_mul(0x9E37_79B1) >> (32 - SLOTS.trailing_zeros())) as usize;
+    loop {
+        match slots[slot] {
+            None => {
+                if palette.len() == budget {
+                    return None;
+                }
+                let index = u8::try_from(palette.len()).expect("the budget is at most 256");
+                slots[slot] = Some(index);
+                palette.push(color);
+                return Some(index);
+            }
+            Some(index) if palette[usize::from(index)] == color => return Some(index),
+            _ => slot = (slot + 1) % SLOTS,
+        }
+    }
 }
 
 /// Quantette has no alpha-mask support. Train its palette only on visible pixels,

@@ -165,3 +165,123 @@ fn encode_into_appends_and_keeps_out_on_an_error() {
     encoder.encode_into(&[0, 0, 255, 255], 1, 1, &mut out).unwrap();
     assert_eq!(out.iter().filter(|&&b| b == 0x1b).count(), 4);
 }
+
+/// One opaque pixel per color, in a single row.
+fn row_of(colors: &[[u8; 3]]) -> Vec<u8> {
+    colors.iter().flat_map(|&[r, g, b]| [r, g, b, 255]).collect()
+}
+
+/// The colors of a grid of seven levels per channel. No channel percent is 2,
+/// so `;2;` counts the palette entries.
+fn grid_colors(count: usize) -> Vec<[u8; 3]> {
+    (0..343u16)
+        .map(|i| [i % 7 * 40, i / 7 % 7 * 40, i / 49 * 40].map(|c| c as u8))
+        .take(count)
+        .collect()
+}
+
+fn encode(encoder: &mut SixelEncoder, rgba: &[u8], width: usize, height: usize) -> String {
+    let mut out = Vec::new();
+    encoder.encode_into(rgba, width, height, &mut out).unwrap();
+    String::from_utf8(out).unwrap()
+}
+
+fn exact(max_colors: u16) -> SixelEncoder {
+    SixelEncoder::new()
+        .with_options(EncodeOptions {
+            max_colors,
+            diffusion: 0.0,
+            ..Default::default()
+        })
+        .with_exact_palette(true)
+}
+
+fn quantized(max_colors: u16) -> SixelEncoder {
+    exact(max_colors).with_exact_palette(false)
+}
+
+#[test]
+fn an_exact_palette_decodes_to_every_color() {
+    // Multiples of 51 are whole percents, so the SIXEL keeps them exactly.
+    let colors: Vec<[u8; 3]> = (0..21u8).map(|i| [i % 6 * 51, i / 6 * 51, (i * 2) % 6 * 51]).collect();
+    let rgba: Vec<u8> = row_of(&colors).repeat(24);
+    let encoded = encode(&mut exact(256), &rgba, 21, 24);
+    assert_eq!(encoded.matches(";2;").count(), 21);
+    assert_eq!(SixelImage::decode(encoded.as_bytes()).unwrap().pixels, rgba);
+}
+
+#[test]
+fn an_exact_palette_holds_up_to_max_colors() {
+    // White goes last, at index 255.
+    let mut colors = grid_colors(255);
+    colors.push([255, 255, 255]);
+    let rgba = row_of(&colors);
+    let encoded = encode(&mut exact(256), &rgba, 256, 1);
+    assert_eq!(encoded.matches(";2;").count(), 256);
+    assert!(encoded.contains("#255;2;100;100;100"));
+    let decoded = SixelImage::decode(encoded.as_bytes()).unwrap().pixels;
+    assert_eq!(decoded[255 * 4..256 * 4], [255, 255, 255, 255]);
+}
+
+#[test]
+fn the_quantizer_merges_colors_that_an_exact_palette_keeps() {
+    let rgba = row_of(&grid_colors(200));
+    let count = |mut encoder| encode(&mut encoder, &rgba, 200, 1).matches(";2;").count();
+    assert_eq!(count(exact(256)), 200);
+    assert!(count(quantized(256)) < 200, "{}", count(quantized(256)));
+}
+
+#[test]
+fn more_colors_than_max_colors_go_to_the_quantizer() {
+    for (count, max_colors) in [(257, 256), (20, 16)] {
+        let rgba = row_of(&grid_colors(count));
+        assert_eq!(
+            encode(&mut exact(max_colors), &rgba, count, 1),
+            encode(&mut quantized(max_colors), &rgba, count, 1)
+        );
+    }
+}
+
+#[test]
+fn a_transparent_pixel_takes_no_color_of_an_exact_palette() {
+    // Multiples of 51 are whole percents, so the SIXEL keeps them exactly.
+    let mut rgba = row_of(&[[0, 0, 0], [51, 102, 153], [255, 204, 0]]);
+    rgba.extend(row_of(&grid_colors(297)));
+    for pixel in rgba.as_chunks_mut::<4>().0.iter_mut().skip(3) {
+        pixel[3] = 0;
+    }
+    let encoded = encode(&mut exact(256), &rgba, 300, 1);
+    assert_eq!(encoded.matches(";2;").count(), 3);
+    let decoded = SixelImage::decode(encoded.as_bytes()).unwrap().pixels;
+    assert_eq!(decoded[..12], rgba[..12]);
+    assert!(decoded[12..].as_chunks::<4>().0.iter().all(|pixel| pixel[3] == 0));
+}
+
+#[test]
+fn a_transparent_image_is_the_same_with_an_exact_palette() {
+    let rgba = [255, 0, 255, 0].repeat(65 * 7);
+    assert_eq!(encode(&mut exact(256), &rgba, 65, 7), encode(&mut quantized(256), &rgba, 65, 7));
+}
+
+#[test]
+fn an_encoder_switches_between_an_exact_palette_and_the_quantizer() {
+    let few = row_of(&grid_colors(40)).repeat(3);
+    let many = row_of(&grid_colors(300));
+    let mut transparent = row_of(&grid_colors(12));
+    transparent[3] = 0;
+    let mut many_transparent = many.clone();
+    many_transparent[3] = 0;
+    let frames: [(&[u8], usize, usize); 7] = [
+        (&few, 40, 3),
+        (&many, 300, 1),
+        (&few, 40, 3),
+        (&transparent, 12, 1),
+        (&many_transparent, 300, 1),
+        (&few, 40, 3),
+        (&few, 60, 2),
+    ];
+    let mut encoder = exact(256);
+    for (rgba, width, height) in frames {
+        assert_eq!(encode(&mut encoder, rgba, width, height), encode(&mut exact(256), rgba, width, height));
+    }
+}
