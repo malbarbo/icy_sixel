@@ -209,15 +209,6 @@ impl SixelEncoder {
     /// with alpha below 128 is transparent, as in [`sixel_encode`]. An error
     /// leaves `out` with the contents it had.
     pub fn encode_into(&mut self, rgba: &[u8], width: usize, height: usize, out: &mut Vec<u8>) -> Result<()> {
-        let written = out.len();
-        let result = self.append(rgba, width, height, out);
-        if result.is_err() {
-            out.truncate(written);
-        }
-        result
-    }
-
-    fn append(&mut self, rgba: &[u8], width: usize, height: usize, out: &mut Vec<u8>) -> Result<()> {
         crate::validate_encode_dimensions(width, height)?;
         let expected = width.checked_mul(height).and_then(|v| v.checked_mul(4)).ok_or(SixelError::IntegerOverflow)?;
         if rgba.len() != expected {
@@ -266,7 +257,8 @@ impl SixelEncoder {
                 bands,
                 ..
             } = scratch;
-            return encode_indexed_to_sixel(palette, indices, opacity_mask, header, bands, out);
+            encode_indexed_to_sixel(palette, indices, opacity_mask, header, bands, out);
+            return Ok(());
         }
 
         // Create image reference for quantette
@@ -295,7 +287,8 @@ impl SixelEncoder {
         let Scratch {
             palette, opacity_mask, bands, ..
         } = scratch;
-        encode_indexed_to_sixel(palette, indexed_image.indices(), opacity_mask, header, bands, out)
+        encode_indexed_to_sixel(palette, indexed_image.indices(), opacity_mask, header, bands, out);
+        Ok(())
     }
 }
 
@@ -453,7 +446,7 @@ pub fn sixel_encode_default(rgba: &[u8], width: usize, height: usize) -> Result<
     sixel_encode(rgba, width, height, &EncodeOptions::default())
 }
 
-fn encode_indexed_to_sixel(palette: &[Rgb], indices: &[u8], opacity_mask: &BitMask, header: Header, bands: &mut Bands, out: &mut Vec<u8>) -> Result<()> {
+fn encode_indexed_to_sixel(palette: &[Rgb], indices: &[u8], opacity_mask: &BitMask, header: Header, bands: &mut Bands, out: &mut Vec<u8>) {
     let Header {
         width,
         height,
@@ -504,8 +497,10 @@ fn encode_indexed_to_sixel(palette: &[Rgb], indices: &[u8], opacity_mask: &BitMa
 
     // Scratch buffer holding the 6-bit sixel value for every (color, column)
     // pair in the current band. Reused across bands; only the rows of colors
-    // actually used in a band are cleared, so this stays cheap.
-    let scratch_len = palette_len.checked_mul(width).ok_or(SixelError::IntegerOverflow)?;
+    // actually used in a band are cleared, so this stays cheap. The product
+    // fits, since the palette holds at most 256 colors and the width is at most
+    // SIXEL_WIDTH_LIMIT.
+    let scratch_len = palette_len * width;
     let Bands { sixels, colors_used } = bands;
     sixels.clear();
     sixels.resize(scratch_len, 0);
@@ -586,8 +581,6 @@ fn encode_indexed_to_sixel(palette: &[Rgb], indices: &[u8], opacity_mask: &BitMa
     // String terminator: ESC \
     out.push(b'\x1b');
     out.push(b'\\');
-
-    Ok(())
 }
 
 /// Fast number to string without allocation
