@@ -304,3 +304,13 @@ fn a_color_in_a_few_columns_decodes_in_place() {
     let decoded = SixelImage::decode(encoded.as_bytes()).unwrap();
     assert_eq!(&decoded.pixels[..rgba.len()], rgba.as_slice());
 }
+
+#[test]
+fn a_transparent_pixel_between_two_of_one_color_stays_transparent() {
+    // The transparent pixel takes the index of red, the first color.
+    let pixels = [[255, 0, 0, 255], [255, 0, 0, 0], [255, 0, 0, 255]].concat();
+    let encoded = encode(&mut exact(256), &pixels, 3, 1);
+    // The decoder fills a whole band of six rows.
+    let decoded = SixelImage::decode(encoded.as_bytes()).unwrap().pixels;
+    assert_eq!(decoded[..12], [[255, 0, 0, 255], [0, 0, 0, 0], [255, 0, 0, 255]].concat());
+}

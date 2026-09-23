@@ -56,6 +56,12 @@ impl BitMask {
         self.words[index >> 6] |= 1u64 << (index & 63);
     }
 
+    /// Returns `true` if the first `len` bits are set, `false` otherwise.
+    fn is_full(&self, len: usize) -> bool {
+        let (words, tail) = (len / 64, len % 64);
+        self.words[..words].iter().all(|&word| word == u64::MAX) && (tail == 0 || self.words[words] == (1u64 << tail) - 1)
+    }
+
     /// Return whether the bit at `index` is set.
     #[inline]
     fn get(&self, index: usize) -> bool {
@@ -755,6 +761,7 @@ fn encode_indexed_to_sixel(palette: &[Rgb], indices: &[u8], opacity_mask: &BitMa
     spans.clear();
     spans.resize(palette_len, None);
 
+    let opacity = (!opacity_mask.is_full(width * height)).then_some(opacity_mask);
     for band in 0..band_count {
         let y0 = band * 6;
         let y_max = usize::min(y0 + 6, height);
@@ -766,23 +773,27 @@ fn encode_indexed_to_sixel(palette: &[Rgb], indices: &[u8], opacity_mask: &BitMa
             }
         }
 
-        // Single pass over the band: scatter each opaque pixel's bit into the
-        // scratch buffer keyed by its color. This replaces the previous
-        // O(colors x pixels) re-scan with a single O(pixels) pass.
+        // Single pass over the band: scatter the bit of each opaque pixel
+        // into the scratch buffer keyed by its color. A drawing has long
+        // runs of one color, so the pass goes run by run.
         for y in y0..y_max {
             let bit = 1u8 << (y - y0);
-            let row = y * width;
-            for x in 0..width {
-                let pixel_idx = row + x;
-                if opacity_mask.get(pixel_idx) {
-                    let color_index = indices[pixel_idx] as usize;
-                    sixels[color_index * width + x] |= bit;
+            let first = y * width;
+            let mut x = 0;
+            while x < width {
+                let (end, index) = run_at(indices, opacity, first, x, width);
+                if let Some(index) = index {
+                    let color_index = usize::from(index);
+                    for sixel in &mut sixels[color_index * width + x..color_index * width + end] {
+                        *sixel |= bit;
+                    }
                     let span = &mut spans[color_index];
                     *span = Some(match *span {
-                        Some((start, end)) => (start.min(x), end.max(x + 1)),
-                        None => (x, x + 1),
+                        Some((start, span_end)) => (start.min(x), span_end.max(end)),
+                        None => (x, end),
                     });
                 }
+                x = end;
             }
         }
 
@@ -835,6 +846,37 @@ fn encode_indexed_to_sixel(palette: &[Rgb], indices: &[u8], opacity_mask: &BitMa
     // String terminator: ESC \
     out.push(b'\x1b');
     out.push(b'\\');
+}
+
+/// The run that starts at column `x` of the row that starts at pixel
+/// `first`, as the column after it and its index. A run holds opaque pixels
+/// of one index, or transparent pixels, which have `None` for an index and
+/// may have no entry in `indices`. `opacity` is `None` when every pixel is
+/// opaque, which spares the mask lookup.
+fn run_at(indices: &[u8], opacity: Option<&BitMask>, first: usize, x: usize, width: usize) -> (usize, Option<u8>) {
+    let mut end = x + 1;
+    match opacity {
+        Some(mask) if !mask.get(first + x) => {
+            while end < width && !mask.get(first + end) {
+                end += 1;
+            }
+            (end, None)
+        }
+        Some(mask) => {
+            let index = indices[first + x];
+            while end < width && mask.get(first + end) && indices[first + end] == index {
+                end += 1;
+            }
+            (end, Some(index))
+        }
+        None => {
+            let index = indices[first + x];
+            while end < width && indices[first + end] == index {
+                end += 1;
+            }
+            (end, Some(index))
+        }
+    }
 }
 
 /// Write `len` empty sixels.
@@ -970,6 +1012,20 @@ mod tests {
         };
         let encoded = encode(&mut SixelEncoder::new().with_options(options), &gradient());
         assert_eq!(encoded.matches(";2;").count(), 2, "{encoded}");
+    }
+
+    #[test]
+    fn a_mask_is_full_when_its_first_bits_are_set() {
+        for len in [1, 63, 64, 65, 128] {
+            let mut mask = BitMask::zeros(len);
+            (0..len).for_each(|i| mask.set(i));
+            assert!(mask.is_full(len), "{len}");
+            for hole in [0, len / 2, len - 1] {
+                let mut mask = BitMask::zeros(len);
+                (0..len).filter(|&i| i != hole).for_each(|i| mask.set(i));
+                assert!(!mask.is_full(len), "{len} {hole}");
+            }
+        }
     }
 
     #[test]
